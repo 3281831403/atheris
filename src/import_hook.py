@@ -48,6 +48,11 @@ SKIP_LOADERS = set([
 ])
 
 
+def _within_subtree(fullname: str, root: str) -> bool:
+  """Returns whether `fullname` is `root` itself or lives under it."""
+  return fullname == root or fullname.startswith(root + ".")
+
+
 # TODO(b/207008147) Mypy does not like abc.FileLoader?
 def _should_skip(loader: Any) -> bool:
   """Returns whether modules loaded with this importer should be ignored."""
@@ -65,23 +70,38 @@ def _should_skip(loader: Any) -> bool:
 class AtherisMetaPathFinder(abc.MetaPathFinder):
   """Finds and loads package metapaths with Atheris loaders."""
 
-  def __init__(self, include_packages: Set[str], exclude_modules: Set[str],
+  def __init__(self, include_modules: Set[str], exclude_modules: Set[str],
                enable_loader_override: bool, trace_dataflow: bool):
     """Finds and loads package metapaths with Atheris loaders.
 
     Args:
-      include_packages: If not empty, an allowlist of packages to instrument.
-      exclude_modules: A denylist of modules to never instrument. This has
-        higher precedent than include_packages.
+      include_modules: If not empty, an allowlist of modules to instrument.
+        Each entry matches an entire subtree: `pkg.sub` matches `pkg.sub`
+        itself and everything below it (e.g. `pkg.sub.util`).
+      exclude_modules: A denylist of modules to never instrument, matched by
+        subtree just like include_modules. This has higher precedent than
+        include_modules.
       enable_loader_override: Use experimental support to instrument bytecode
         loaded from custom loaders.
       trace_dataflow: Whether or not to trace dataflow.
     """
     super().__init__()
-    self._include_packages = include_packages
+    self._include_modules = include_modules
     self._exclude_modules = exclude_modules
     self._trace_dataflow = trace_dataflow
     self._enable_loader_override = enable_loader_override
+
+  def _covers(self, fullname: str) -> bool:
+    """Returns whether this finder's layer contains the given module."""
+    if not self._include_modules:
+      return True
+    return any(
+        _within_subtree(fullname, root) for root in self._include_modules)
+
+  def _is_excluded(self, fullname: str) -> bool:
+    """Returns whether the given module is excluded (by subtree)."""
+    return any(
+        _within_subtree(fullname, root) for root in self._exclude_modules)
 
   def find_spec(
       self,
@@ -100,91 +120,104 @@ class AtherisMetaPathFinder(abc.MetaPathFinder):
     Returns:
       The ModuleSpec if found, not excluded, and included if any are included.
     """
-    if fullname in self._exclude_modules:
+    if fullname.split(".")[0] == "atheris":
       return None
 
-    package_name = fullname.split(".")[0]
+    # Each layer only adjudicates imports that fall within its own include
+    # set; anything else is left to the other finders.
+    if not self._covers(fullname):
+      return None
 
-    if (not self._include_packages or
-        package_name in self._include_packages) and package_name != "atheris":
-      # Try each importer after the Atheris importer until we find an acceptable
-      # one
-      found_atheris = False
-      for meta in sys.meta_path:
-        # Skip any loaders before (or including) the Atheris loader
-        if not found_atheris:
-          if meta is self:
-            found_atheris = True
-          continue
+    # When layers are nested, the innermost layer covering this module makes
+    # the decision. Finders are consulted in sys.meta_path order, and each
+    # nested HookManager inserts its finder ahead of the outer ones, so the
+    # first covering Atheris finder on sys.meta_path is the innermost one.
+    for meta in sys.meta_path:
+      if isinstance(meta, AtherisMetaPathFinder) and meta._covers(fullname):
+        if meta is not self:
+          return None
+        break
 
-        # Check each remaining loader
-        if not hasattr(meta, "find_spec"):
-          continue
+    if self._is_excluded(fullname):
+      return None
 
-        spec = meta.find_spec(fullname, path, target)
-        if spec is None or spec.loader is None:
-          continue
+    # Try each importer after the Atheris importer until we find an acceptable
+    # one
+    found_atheris = False
+    for meta in sys.meta_path:
+      # Skip any loaders before (or including) the Atheris loader
+      if not found_atheris:
+        if meta is self:
+          found_atheris = True
+        continue
 
-        if _should_skip(spec.loader):
+      # Check each remaining loader
+      if not hasattr(meta, "find_spec"):
+        continue
+
+      spec = meta.find_spec(fullname, path, target)
+      if spec is None or spec.loader is None:
+        continue
+
+      if _should_skip(spec.loader):
+        return None
+
+      if isinstance(spec.loader, machinery.ExtensionFileLoader):
+        # An extension, coverage doesn't come from Python
+        return None
+
+      sys.stderr.write(f"INFO: Instrumenting {fullname}\n")
+
+      # Use normal inheritance for the common cases. This may not be needed
+      # (the dynamic case should work for everything), but keep this for as
+      # long as that's experimental.
+      if _frozen_importlib_external is not None and isinstance(
+          spec.loader, _frozen_importlib_external.SourceFileLoader  # pytype: disable=attribute-error
+      ):
+        spec.loader = AtherisSourceFileLoader(spec.loader.name,
+                                              spec.loader.path,
+                                              self._trace_dataflow)
+        return spec
+
+      elif _frozen_importlib_external is not None and isinstance(
+          spec.loader, _frozen_importlib_external.SourcelessFileLoader  # pytype: disable=attribute-error
+      ):
+        spec.loader = AtherisSourcelessFileLoader(spec.loader.name,
+                                                  spec.loader.path,
+                                                  self._trace_dataflow)
+        return spec
+
+      else:
+        # The common case isn't what we have, so wrap an existing object
+        # via composition.
+
+        if not self._enable_loader_override:
+          sys.stderr.write("WARNING: Skipping import with custom loader.\n")
           return None
 
-        if isinstance(spec.loader, machinery.ExtensionFileLoader):
-          # An extension, coverage doesn't come from Python
-          return None
+        global _warned_experimental
+        if not _warned_experimental:
+          sys.stderr.write(
+              "WARNING: It looks like this module is imported by a "
+              "custom loader. Atheris has experimental support for this. "
+              "However, it may be incompatible with certain libraries. "
+              "If you experience unusual errors or poor coverage "
+              "collection, try atheris.instrument_all() instead, add "
+              "enable_loader_override=False to instrument_imports(), or "
+              "file an issue on GitHub.\n")
+          _warned_experimental = True
 
-        sys.stderr.write(f"INFO: Instrumenting {fullname}\n")
-
-        # Use normal inheritance for the common cases. This may not be needed
-        # (the dynamic case should work for everything), but keep this for as
-        # long as that's experimental.
-        if _frozen_importlib_external is not None and isinstance(
-            spec.loader, _frozen_importlib_external.SourceFileLoader  # pytype: disable=attribute-error
-        ):
-          spec.loader = AtherisSourceFileLoader(spec.loader.name,
-                                                spec.loader.path,
-                                                self._trace_dataflow)
-          return spec
-
-        elif _frozen_importlib_external is not None and isinstance(
-            spec.loader, _frozen_importlib_external.SourcelessFileLoader  # pytype: disable=attribute-error
-        ):
-          spec.loader = AtherisSourcelessFileLoader(spec.loader.name,
-                                                    spec.loader.path,
+        try:
+          spec.loader = make_dynamic_atheris_loader(spec.loader,
                                                     self._trace_dataflow)
           return spec
-
-        else:
-          # The common case isn't what we have, so wrap an existing object
-          # via composition.
-
-          if not self._enable_loader_override:
-            sys.stderr.write("WARNING: Skipping import with custom loader.\n")
-            return None
-
-          global _warned_experimental
-          if not _warned_experimental:
-            sys.stderr.write(
-                "WARNING: It looks like this module is imported by a "
-                "custom loader. Atheris has experimental support for this. "
-                "However, it may be incompatible with certain libraries. "
-                "If you experience unusual errors or poor coverage "
-                "collection, try atheris.instrument_all() instead, add "
-                "enable_loader_override=False to instrument_imports(), or "
-                "file an issue on GitHub.\n")
-            _warned_experimental = True
-
-          try:
-            spec.loader = make_dynamic_atheris_loader(spec.loader,
-                                                      self._trace_dataflow)
-            return spec
-          except Exception:  # pylint: disable=broad-except
-            sys.stderr.write("WARNING: This module uses a custom loader that "
-                             "prevents it from being instrumented: "
-                             f"{spec.loader}\n")
-            return None
-
+        except Exception:  # pylint: disable=broad-except
+          sys.stderr.write("WARNING: This module uses a custom loader that "
+                           "prevents it from being instrumented: "
+                           f"{spec.loader}\n")
           return None
-      return None
+
+        return None
     return None
 
   def invalidate_caches(self) -> None:
@@ -278,21 +311,30 @@ def make_dynamic_atheris_loader(loader: Any, trace_dataflow: bool) -> Any:
 
 
 class HookManager:
-  """A Context manager that manages hooks."""
+  """A Context manager that manages hooks.
 
-  def __init__(self, include_packages: Set[str], exclude_modules: Set[str],
+  HookManagers nest: each instance installs its own AtherisMetaPathFinder on
+  __enter__ and removes exactly that finder on __exit__, so sys.meta_path is
+  restored to whatever it was before the `with` block, and an inner `with`
+  block never disturbs the finders of enclosing blocks.
+  """
+
+  def __init__(self, include_modules: Set[str], exclude_modules: Set[str],
                enable_loader_override: bool, trace_dataflow: bool):
-    self._include_packages = include_packages
+    self._include_modules = include_modules
     self._exclude_modules = exclude_modules
     self._enable_loader_override = enable_loader_override
     self._trace_dataflow = trace_dataflow
+    self._finder: Optional[AtherisMetaPathFinder] = None
 
   def __enter__(self) -> "HookManager":
-    i = 0
-    while i < len(sys.meta_path):
-      if isinstance(sys.meta_path[i], AtherisMetaPathFinder):
-        return self
-      i += 1
+    if self._finder is not None:
+      # This manager is already entered; don't install a second finder.
+      return self
+
+    finder = AtherisMetaPathFinder(self._include_modules, self._exclude_modules,
+                                   self._enable_loader_override,
+                                   self._trace_dataflow)
 
     i = 0
     while i < len(sys.meta_path) and sys.meta_path[i] in [
@@ -300,21 +342,19 @@ class HookManager:
     ]:
       i += 1
 
-    sys.meta_path.insert(
-        i,
-        AtherisMetaPathFinder(self._include_packages, self._exclude_modules,
-                              self._enable_loader_override,
-                              self._trace_dataflow))
+    sys.meta_path.insert(i, finder)
+    self._finder = finder
 
     return self
 
   def __exit__(self, *args: Any) -> None:
-    i = 0
-    while i < len(sys.meta_path):
-      if isinstance(sys.meta_path[i], AtherisMetaPathFinder):
-        sys.meta_path.pop(i)
-      else:
-        i += 1
+    if self._finder is None:
+      return
+    try:
+      sys.meta_path.remove(self._finder)
+    except ValueError:
+      pass
+    self._finder = None
 
 
 def instrument_imports(include: Optional[Sequence[str]] = None,
@@ -323,9 +363,11 @@ def instrument_imports(include: Optional[Sequence[str]] = None,
   """Returns a context manager that will instrument modules as imported.
 
   Args:
-    include: module names that shall be instrumented. Submodules within these
-      packages will be recursively instrumented too.
-    exclude: module names that shall not be instrumented.
+    include: module names that shall be instrumented. Each name matches an
+      entire subtree: `pkg.sub` instruments `pkg.sub` itself and everything
+      below it (e.g. `pkg.sub.util`), but not its siblings (e.g. `pkg.other`).
+    exclude: module names that shall not be instrumented. Matched by subtree
+      just like `include`, and takes precedence over `include`.
     enable_loader_override: Whether or not to enable the experimental feature of
       instrumenting custom loaders.
 
@@ -338,8 +380,6 @@ def instrument_imports(include: Optional[Sequence[str]] = None,
   include = [] if include is None else list(include)
   exclude = [] if exclude is None else list(exclude)
 
-  include_packages = set()
-
   for module_name in include + exclude:
     if not isinstance(module_name, str):
       raise TypeError("atheris.instrument_imports() expects names of " +
@@ -351,14 +391,8 @@ def instrument_imports(include: Optional[Sequence[str]] = None,
       raise ValueError("atheris.instrument_imports(): Please specify fully " +
                        "qualified module names (absolute not relative)")
 
-  for module_name in include:
-    if "." in module_name:
-      module_name = module_name.split(".")[0]
-
-    include_packages.add(module_name)
-
   return HookManager(
-      include_packages,
+      set(include),
       set(exclude),
       enable_loader_override,
       trace_dataflow=True)

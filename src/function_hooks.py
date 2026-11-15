@@ -204,8 +204,22 @@ def gen_match(pattern: AnyStr) -> AnyStr:
   return gen_match_recursive(pat, type(pattern), respect_lookarounds=True)  # type: ignore[bad-return-type]
 
 
+# The `re._compile` function as it was before hook_re_module() replaced it,
+# or None if the regex hook is not currently installed.
+_original_re_compile = None
+
+
 def hook_re_module() -> None:
-  """Adds Atheris instrumentation hooks to the `re` module."""
+  """Adds Atheris instrumentation hooks to the `re` module.
+
+  Idempotent: calling this while the hook is already installed does nothing,
+  so repeated calls never stack proxies on top of each other.
+  """
+  global _original_re_compile
+  if _original_re_compile is not None:
+    # Already hooked.
+    return
+
   pattern_gen_map = {}  # type: ignore
 
   original_compile_func = re._compile  # type: ignore[module-attr]
@@ -237,8 +251,25 @@ def hook_re_module() -> None:
 
   # actually hook the `_compile` function now
   # pylint: disable=protected-access
+  _original_re_compile = original_compile_func
   re._compile = _compile_hook  # type: ignore[attr-defined]
   # pylint: enable=protected-access
+
+
+def unhook_re_module() -> None:
+  """Removes the Atheris instrumentation hooks from the `re` module.
+
+  Restores `re._compile` to whatever it was before hook_re_module() ran.
+  Idempotent: calling this while the hook is not installed does nothing.
+  """
+  global _original_re_compile
+  if _original_re_compile is None:
+    return
+
+  # pylint: disable=protected-access
+  re._compile = _original_re_compile  # type: ignore[attr-defined]
+  # pylint: enable=protected-access
+  _original_re_compile = None
 
 
 class EnabledHooks:
@@ -256,6 +287,20 @@ class EnabledHooks:
       elif hook == "str":
         hook_str_module()
         self._enabled_hooks.add(hook)
+
+  def discard(self, hook: str) -> None:
+    """Disables a hook, restoring any state it changed.
+
+    Like set.discard, this is a no-op if the hook is not currently enabled.
+    """
+    hook = hook.lower()
+    if hook not in self._enabled_hooks:
+      return
+    if hook == "regex":
+      unhook_re_module()
+    # The "str" hook cannot be uninstalled from the native module, but
+    # removing it from this set stops _hook_str from tracing.
+    self._enabled_hooks.discard(hook)
 
   def __contains__(self, hook: str) -> bool:
     return hook.lower() in self._enabled_hooks

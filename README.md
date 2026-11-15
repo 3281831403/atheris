@@ -115,6 +115,10 @@ Similarly, Atheris can instrument str methods; currently only `str.startswith`
 and `str.endswith` are supported. To enable this feature, add
 `atheris.enabled_hooks.add("str")`. This is currently an experimental feature.
 
+A hook can be disabled again with `atheris.enabled_hooks.discard("RegEx")`
+(or `"str"`), which restores `re._compile` to its original value; calling
+`discard` for a hook that is not enabled is a no-op.
+
 #### Why am I getting "No interesting inputs were found"?
 
 You might see this error:
@@ -307,8 +311,10 @@ Generally, it's best to import `atheris` first and then import all other librari
 Next, define a fuzzer entry point function and pass it to `atheris.Setup()` along with the fuzzer's arguments (typically `sys.argv`). Finally, call `atheris.Fuzz()` to start fuzzing. You must call `atheris.Setup()` before `atheris.Fuzz()`.
 
 #### `instrument_imports(include=[], exclude=[])`
-- `include`: A list of fully-qualified module names that shall be instrumented.
-- `exclude`: A list of fully-qualified module names that shall NOT be instrumented.
+- `include`: A list of fully-qualified module names that shall be instrumented. Each name matches an entire subtree: `pkg.sub` instruments `pkg.sub` and everything below it, but not its siblings.
+- `exclude`: A list of fully-qualified module names that shall NOT be instrumented. Also matched by subtree, and takes precedence over `include`.
+
+`with`-blocks of `instrument_imports()` may be nested: each block only decides the imports covered by its own `include` set (the innermost block covering a module wins), and exiting a block restores `sys.meta_path` to its previous state.
 
 This should be used together with a `with`-statement. All modules imported in
 said statement will be instrumented. However, because Python imports all modules
